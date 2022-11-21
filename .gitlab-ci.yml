@@ -1,0 +1,411 @@
+default:
+  image: ${CI_REGISTRY}/android/shared/docker-android/ndk:v1.0.0
+  before_script:
+    # We must keep these variables here. We can't do it inside the entrypoint, as idk how but
+    # gitlab is going to convert them as a variable content instead of a variable file...
+    - base64 -d - < "$PROTON_KEY_FILE2" > app/protonkey.jks
+    - base64 -d -  < "$SERVICE_ACCOUNT_FILE" > app/service_account.json
+    - md5sum app/protonkey.jks
+    - md5sum app/service_account.json
+    - echo "" >> gradle.properties # ensure a new line
+    - base64 -d - < "$GRADLE_PROPERTIES_FILE2" >> gradle.properties
+    - git fetch origin development
+    - !reference [.checkout-core-submodule, before_script]
+    - if [[ -f /load-env.sh ]]; then source /load-env.sh; fi
+  interruptible: true
+
+variables:
+  ATLAS_DEPLOY_SCOPE: $CI_PIPELINE_ID
+  ATLAS_DEPLOY_END:
+    value: 'true'
+    description: Set to false if we do not need for a new deployed environment
+  ATLAS_DEPLOY_LIST:
+    value: fe-vpn:main
+    description: List of components to deploy (fe-vpn:v4.7.0:prod+t to use a tag)
+  TEST_ENV_DOMAIN: $DYNAMIC_DOMAIN/api
+  GIT_FETCH_EXTRA_FLAGS: --tags
+  ORG_GRADLE_PROJECT_useCoreGitSubmodule: "false"
+
+stages:
+  - prevent-interrupt
+  - image
+  - analyze
+  - deploy
+  - build
+  - startReview
+  - test
+  - report
+  - bot
+  - mirror
+  - publish
+  - cleanup
+
+# Make development and master uninterruptible.
+# Based on https://gitlab.com/gitlab-org/gitlab/-/issues/194023#note_928958193
+prevent-interrupt:
+  stage: prevent-interrupt
+  tags:
+    - small
+  rules:
+    - if: $CI_COMMIT_BRANCH == "development" || $CI_COMMIT_BRANCH == "master"
+      when: always
+  interruptible: false
+  cache: []
+  before_script: []
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "$CI_COMMIT_BRANCH is uninterruptible"
+
+.gradle-build-cache: &gradle-build-cache
+  key:
+    prefix: gradle-build-cache
+    files:
+      - gradle/wrapper/gradle-wrapper.properties
+  paths:
+    - ${CI_PROJECT_DIR}/build/gradle-build-cache
+  policy: pull
+
+.gradle-job:
+  variables:
+    CHECKOUT_CORE_SUBMODULE: "true"
+
+cache:
+  - key: $CI_COMMIT_REF_SLUG
+    policy: pull
+    paths:
+      - .gradle
+
+  - key: ${CI_COMMIT_SHORT_SHA}
+    policy: pull
+    paths:
+      - '**/build/tmp/'
+
+  - <<: *gradle-build-cache
+
+deploy:test-env:
+  extends: deploy:review
+  retry: 1
+  needs: []
+  cache: []
+  rules: &rules_deploy_cleanup
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - when: on_success
+
+cleanup:test-env:
+  extends: cleanup:review
+  needs: ["deploy:test-env", "mobile tests black", "tv tests"]
+  rules: *rules_deploy_cleanup
+
+detekt analysis:
+  stage: analyze
+  extends: .gradle-job
+  cache:
+    - key: $CI_COMMIT_REF_SLUG
+      policy: pull-push
+      paths:
+        - .gradle
+  except:
+    - schedules
+  tags:
+    - medium
+  script:
+    - ./gradlew :app:detekt
+  artifacts:
+    expire_in: 4 weeks
+    paths:
+      - app/build/reports/detekt/
+    reports:
+      codequality: app/build/reports/detekt/detekt.json
+
+build google debug:
+  stage: build
+  extends: .gradle-job
+  cache:
+    - key: $CI_COMMIT_REF_SLUG
+      policy: pull
+      paths:
+        - .gradle
+
+    - key: ${CI_COMMIT_SHORT_SHA}
+      policy: push
+      paths:
+        - '**/build/tmp/'
+
+    - <<: *gradle-build-cache
+      policy: pull-push
+  except:
+    - schedules
+  tags:
+    - xlarge-k8s
+  script:
+    - ./gradlew assembleGooglePlayDebug
+    - ./gradlew assembleGooglePlayDebugAndroidTest
+    - export ARCHIVES_BASE_NAME=$(./gradlew -q getArchivesName | tail -n 1)
+    - echo ${ARCHIVES_BASE_NAME}
+    - echo "ARCHIVES_BASE_NAME=${ARCHIVES_BASE_NAME}" > deploy.env
+  artifacts:
+    expire_in: 1 week
+    paths:
+    - app/build/outputs/apk
+    reports:
+      dotenv: deploy.env
+
+build black:
+  stage: build
+  tags:
+    - xlarge-k8s
+  extends: .gradle-job
+  except:
+    - schedules
+  script:
+    - export BLACK_TOKEN="$(curl --silent $BLACK_TOKEN_URL)"
+    - echo "Black url ${TEST_ENV_DOMAIN}"
+    - ./gradlew assembleBlackDebug
+    - ./gradlew assembleBlackDebugAndroidTest
+  artifacts:
+    expire_in: 1 week
+    paths:
+    - app/build/outputs/apk
+
+build google play release:
+  stage: build
+  extends: .gradle-job
+  except:
+    - master
+    - schedules
+  tags:
+    - xlarge-k8s
+  script:
+    - ./gradlew openvpn:assemble
+    - ./gradlew assembleGooglePlayRelease -PabiSplit -PbuildUniversalApk
+  when: manual
+  interruptible: false
+  artifacts:
+    expire_in: 1 week
+    paths:
+    - app/build/outputs/apk
+
+build amazon release:
+  stage: build
+  extends: .gradle-job
+  only:
+    refs:
+      - master
+  except:
+    - schedules
+  tags:
+    - xlarge-k8s
+  script:
+    - ./gradlew openvpn:assemble
+    - ./gradlew assembleAmazonRelease -PabiSplit -PbuildUniversalApk
+  artifacts:
+    expire_in: 3 week
+    paths:
+      - app/build/outputs/apk
+
+build release (auto):
+  stage: build
+  extends: .gradle-job
+  only:
+    refs:
+      - master
+  except:
+    - schedules
+  tags:
+    - xlarge-k8s
+  script:
+    - ./gradlew openvpn:assemble
+    - ./gradlew assembleDirectRelease -PabiSplit -PbuildUniversalApk
+  artifacts:
+    expire_in: 3 week
+    paths:
+      - app/build/outputs/apk
+
+unit tests:
+  stage: test
+  extends: .gradle-job
+  tags:
+    - large
+  except:
+    - schedules
+  script:
+    - ./gradlew testBlackDebug
+
+coverage report:
+  stage: report
+  extends: .gradle-job
+  tags:
+    - large
+  script:
+    - ./gradlew jacocoTestReport
+    - ./gradlew coverageReport
+    - python3 jacocoConverter.py app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml app/src/main/java > app/build/reports/cobertura-coverage.xml    
+    # create top level artifact index to direct users to the deep index
+    - echo "<script>window.location='app/build/reports/jacoco/jacocoTestReport/html/index.html'</script>" > index.html
+    - echo "<a href='app/build/reports/jacoco/jacocoTestReport/html/index.html'>go here</a>" >> index.html
+  only:
+    - branches
+  except:
+    - schedules
+  allow_failure: true
+  coverage: '/Total coverage: \d+.\d+/'
+  artifacts:
+    expire_in: 1 week
+    expose_as: 'Coverage html'
+    paths: 
+      - app/build/reports/jacoco/jacocoTestReport/html
+      - index.html
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: app/build/reports/cobertura-coverage.xml
+
+pages:
+  stage: publish
+  tags:
+    - small
+  only:
+    refs:
+      - development
+  except:
+    - schedules
+  script:
+    - mkdir public
+    - mv app/build/reports/jacoco/jacocoTestReport/html/* public
+  artifacts:
+    paths:
+      - public
+
+owasp check:
+  stage: report
+  extends: .gradle-job
+  tags:
+    - large
+  script:
+    - ./gradlew dependencyCheckAggregate
+  when: manual
+  interruptible: false
+  artifacts:
+    expire_in: 1 week
+    paths:
+      - build/reports
+
+sync-app:
+  cache: {}
+  stage: mirror
+  only:
+    refs:
+      - master
+  before_script:
+    - !reference [ default, before_script ]
+    - apt update && apt-get install -y connect-proxy
+  script:
+    # Clone instead of using the current CI as it creates the error (shallow update not allowed)
+    - git clone "$CI_REPOSITORY_URL" --branch master _APP_CLONE;
+    - cd _APP_CLONE
+    - git remote add public $PUBLIC_REPO_URL
+    - git push public master
+    # Push the latest tag we can find
+    - git push public "$(git describe --abbrev=0)"
+
+publish-apk-internal:
+  stage: publish
+  tags:
+    - xlarge-k8s
+  extends: .gradle-job
+  only:
+    refs:
+      - development
+  except:
+    - schedules
+  script:
+    - ./gradlew openvpn:assemble
+    - ./gradlew publishInternal -PabiSplit
+
+startReview:
+  before_script:
+    - export REVIEW_APP_ARTIFACT_PATH="app/build/outputs/apk/googlePlay/debug/"${ARCHIVES_BASE_NAME}-googlePlay-debug.apk
+    - echo ${REVIEW_APP_ARTIFACT_PATH}
+  extends: .startReview
+  except:
+    - schedules
+
+stopReview:
+  before_script: []
+  extends: .stopReview
+
+include:
+  - project: 'translations/generator'
+    ref: master
+    file: '/jobs/sync-crowdin.gitlab-ci.yml'
+
+  - project: 'translations/generator'
+    ref: master
+    file: '/jobs/commit-locales.gitlab-ci.yml'
+
+  - project: 'agarroux/publish-github'
+    ref: master
+    file: '/jobs/release.gitlab-ci.yml'
+
+  - project: 'proton/mobile/android/proton-libs'
+    ref: main
+    file: '/ci/templates/checkout-core.gitlab-ci.yml'
+
+  - project: 'proton/mobile/android/proton-libs'
+    ref: main
+    file: '/ci/templates-shared/appetize-integration.yml'
+
+  - local: '/.gitlab-ci-firebase.yml'
+
+  - local: '.download-upload.gitlab-ci.yml'
+
+  - project: 'proton/devops/atlas-deploy'
+    ref: main
+    file: '/scenarios/pipeline-env.yml'
+
+i18n-sync-crowdin:
+  variables:
+      I18N_SYNC_BRANCH: development
+      I18N_SYNC_CROWDIN_PROJECT: 'android-vpn'
+  extends: .i18n-sync-crowdin-shared
+
+i18n-commit-locales:
+  variables:
+      I18N_COMMIT_BRANCH_PUSH: development
+      I18N_COMMIT_BRANCH_ALLOWED: development
+      I18N_COMMIT_CROWDIN_PROJECT: 'android-vpn'
+  extends: .i18n-commit-locales-shared
+
+i18n-sync-crowdin-new-plans:
+  variables:
+    I18N_SYNC_BRANCH: feat/rebranding-main
+    I18N_SYNC_CROWDIN_PROJECT: 'android-vpn'
+  extends: .i18n-sync-crowdin-shared
+
+publish-github:
+  stage: publish
+  only:
+    refs:
+      - master
+  interruptible: false
+  variables:
+    RELEASE_APP: android-vpn
+    RELEASE_GITHUB_REPOSITORY: $PUBLIC_REPO_URL
+  extends: .release-make-release
+
+publish downloads:
+  extends: .publish-download-base
+  only:
+    refs:
+      - master
+  interruptible: false
+  variables:
+    ORIGIN_OAUTH_URL: "${OAUTH_DOWNLOADS_REPO_URL}"
+    ARTIFACT_PATH: "app/build/outputs/apk/direct/release/${ARCHIVES_BASE_NAME}-direct-universal-release.apk"
+    ARTIFACT_OUTPUT_NAME: "ProtonVPN.apk"
+    SLACK_HOOK: "${SLACK_HOOK_DEPLOY_CHANNEL}"
+    SLACK_MESSAGE: '{"text":"Updated ProtonVPN.apk. <!subteam^S039FS9JUKT> can someone deploy downloads? Thanks :)"}'

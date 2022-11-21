@@ -1,0 +1,18 @@
+mobileTest:
+  timeout: 30m
+  device:
+  - model: Pixel2.arm
+    version: 28
+  - model: Nexus5X
+    version: 23
+realConnectionTest:
+  timeout: 30m
+  device:
+  - model: bluejay
+    version: 32
+tvTest:
+  timeout: 30m
+  device:
+  - model: GoogleTvEmulator
+    orientation: landscape
+    version: 30
